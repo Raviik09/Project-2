@@ -42,7 +42,7 @@ result_relation_t &RadixJoin::join() {
         return result;
     }
 
-    double desired_partition_payload_size = static_cast<double>(Config::L3_CACHE_SIZE) / 8.0; // Base: L3 Divisor set to 8.0
+    double desired_partition_payload_size = static_cast<double>(Config::L3_CACHE_SIZE) / 8.0; // Optimal: L3 Divisor set to 8.0
 
     double num_partitions_for_cache_double = 1.0;
     if (smaller_relation_size_bytes > 0 && desired_partition_payload_size > 0) {
@@ -183,7 +183,7 @@ result_relation_t &RadixJoin::join() {
                         ht.emplace(r_part_data[i].key, r_part_data[i].rid);
                     }
 
-                    const int PREFETCH_DISTANCE = 16; // Define prefetch distance
+                    const int PREFETCH_DISTANCE = 8; // Tuned prefetch distance
                     for (uint64_t i = 0; i < s_part_count; ++i) {
                         // Prefetch next element
                         if (i + PREFETCH_DISTANCE < s_part_count) {
@@ -201,7 +201,7 @@ result_relation_t &RadixJoin::join() {
                         ht.emplace(s_part_data[i].key, s_part_data[i].rid);
                     }
 
-                    const int PREFETCH_DISTANCE = 16; // Define prefetch distance
+                    const int PREFETCH_DISTANCE = 8; // Tuned prefetch distance
                     for (uint64_t i = 0; i < r_part_count; ++i) {
                         // Prefetch next element
                         if (i + PREFETCH_DISTANCE < r_part_count) {
