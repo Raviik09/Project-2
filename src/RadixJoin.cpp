@@ -42,7 +42,7 @@ result_relation_t &RadixJoin::join() {
         return result;
     }
 
-    double desired_partition_payload_size = static_cast<double>(Config::L3_CACHE_SIZE) / 8.0; // Optimized: Smaller target partitions
+    double desired_partition_payload_size = static_cast<double>(Config::L3_CACHE_SIZE) / 8.0; // Base: L3 Divisor set to 8.0
 
     double num_partitions_for_cache_double = 1.0;
     if (smaller_relation_size_bytes > 0 && desired_partition_payload_size > 0) {
@@ -61,7 +61,7 @@ result_relation_t &RadixJoin::join() {
 
     uint32_t k_radix_bits = std::max({k_for_cache, k_for_cores});
     k_radix_bits = std::max(1u, k_radix_bits);
-    k_radix_bits = std::min(k_radix_bits, 12u); // Optimized: Allow more partitions if needed
+    k_radix_bits = std::min(k_radix_bits, 11u); // Tuned: Allow up to 2048 partitions
 
     uint32_t N_partitions = 1 << k_radix_bits;
     uint64_t radix_mask = N_partitions - 1;
@@ -116,20 +116,32 @@ result_relation_t &RadixJoin::join() {
             output.prefix_sum[p] = output.prefix_sum[p - 1] + output.histogram[p - 1];
         }
 
-        std::vector<std::atomic<uint64_t>> current_partition_counters(current_N_partitions);
+        // --- Calculate Thread-Specific Write Pointers (Non-Atomic Scatter Setup) ---
+        std::vector<std::vector<uint64_t>> thread_starting_write_positions(
+            Config::NUM_CORES, std::vector<uint64_t>(current_N_partitions));
+
         for (uint32_t p = 0; p < current_N_partitions; ++p) {
-            current_partition_counters[p].store(output.prefix_sum[p], std::memory_order_relaxed);
+            uint64_t current_offset_for_p = output.prefix_sum[p];
+            for (uint32_t t_idx = 0; t_idx < Config::NUM_CORES; ++t_idx) {
+                thread_starting_write_positions[t_idx][p] = current_offset_for_p;
+                current_offset_for_p += local_histograms[t_idx][p];
+            }
         }
 
+        // --- Parallel Scatter Operation (Non-Atomic Per Tuple) ---
         for (uint32_t t_id = 0; t_id < Config::NUM_CORES; ++t_id) {
             threads.emplace_back([&, t_id]() {
+                // Each thread gets its own set of current write pointers, initialized from thread_starting_write_positions
+                std::vector<uint64_t> current_thread_p_counters = thread_starting_write_positions[t_id];
+
                 uint64_t start_idx = t_id * tuples_per_thread;
                 uint64_t end_idx = std::min(start_idx + tuples_per_thread, input_relation.number_tuples);
+
                 for (uint64_t i = start_idx; i < end_idx; ++i) {
                     const auto& tuple = input_relation.data[i];
                     uint64_t p_idx = tuple.key & current_radix_mask;
-                    uint64_t write_pos = current_partition_counters[p_idx].fetch_add(1, std::memory_order_relaxed);
-                    output.partitioned_relation.data[write_pos] = tuple;
+                    output.partitioned_relation.data[current_thread_p_counters[p_idx]] = tuple;
+                    current_thread_p_counters[p_idx]++; // Non-atomic increment of thread-local counter
                 }
             });
         }
@@ -170,7 +182,13 @@ result_relation_t &RadixJoin::join() {
                     for (uint64_t i = 0; i < r_part_count; ++i) {
                         ht.emplace(r_part_data[i].key, r_part_data[i].rid);
                     }
+
+                    const int PREFETCH_DISTANCE = 16; // Define prefetch distance
                     for (uint64_t i = 0; i < s_part_count; ++i) {
+                        // Prefetch next element
+                        if (i + PREFETCH_DISTANCE < s_part_count) {
+                            __builtin_prefetch(&s_part_data[i + PREFETCH_DISTANCE], 0, 3); // 0 for read, 3 for high locality
+                        }
                         auto range = ht.equal_range(s_part_data[i].key);
                         for (auto it = range.first; it != range.second; ++it) {
                             thread_local_results[t_id].emplace_back(it->second, s_part_data[i].rid);
@@ -182,7 +200,13 @@ result_relation_t &RadixJoin::join() {
                     for (uint64_t i = 0; i < s_part_count; ++i) {
                         ht.emplace(s_part_data[i].key, s_part_data[i].rid);
                     }
+
+                    const int PREFETCH_DISTANCE = 16; // Define prefetch distance
                     for (uint64_t i = 0; i < r_part_count; ++i) {
+                        // Prefetch next element
+                        if (i + PREFETCH_DISTANCE < r_part_count) {
+                            __builtin_prefetch(&r_part_data[i + PREFETCH_DISTANCE], 0, 3); // 0 for read, 3 for high locality
+                        }
                         auto range = ht.equal_range(r_part_data[i].key);
                         for (auto it = range.first; it != range.second; ++it) {
                             thread_local_results[t_id].emplace_back(r_part_data[i].rid, it->second);
