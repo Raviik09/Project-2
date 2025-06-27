@@ -18,6 +18,90 @@ RadixJoin::RadixJoin(relation_t &R, relation_t &S) : R_(R), S_(S) {
 RadixJoin::~RadixJoin() {
 }
 
+namespace { // Anonymous namespace for helper structures specific to this file
+
+// Custom Linear Probing Hash Table for Radix Join (build on R, probe with S)
+// Assumes keys from R (build side) are unique within an R-partition.
+// Uses Struct-of-Arrays (SoA) layout.
+class SimpleLinearProbeHashTable {
+public:
+    std::vector<uint64_t> keys_;
+    std::vector<uint64_t> rids_;
+    std::vector<bool> occupied_;
+
+    uint64_t table_size_;
+    uint64_t num_elements_;
+
+    inline uint64_t hash_function(uint64_t key) const {
+        return std::hash<uint64_t>{}(key) % table_size_;
+    }
+
+public:
+    SimpleLinearProbeHashTable(const tuple_t* r_partition_data, uint64_t r_partition_count)
+        : num_elements_(0) {
+        if (r_partition_count == 0) {
+            table_size_ = 0;
+            return;
+        }
+
+        table_size_ = std::max(1UL, r_partition_count * 2UL);
+
+
+        keys_.resize(table_size_);
+        rids_.resize(table_size_);
+        occupied_.resize(table_size_, false); // Initialize all slots as not occupied
+
+        for (uint64_t i = 0; i < r_partition_count; ++i) {
+            const auto& r_tuple = r_partition_data[i];
+            uint64_t current_key = r_tuple.key;
+            uint64_t current_rid = r_tuple.rid;
+
+            uint64_t slot_idx = hash_function(current_key);
+
+            while (occupied_[slot_idx]) {
+                // Since keys in R are unique, we don't expect to find the same key here.
+                // If occupied, just move to the next slot (linear probing).
+                slot_idx = (slot_idx + 1) % table_size_;
+            }
+
+            keys_[slot_idx] = current_key;
+            rids_[slot_idx] = current_rid;
+            occupied_[slot_idx] = true;
+            num_elements_++;
+        }
+    }
+
+    // Looks for s_key (from S partition) in the hash table.
+    // If found, sets out_r_rid to the rid from R and returns true.
+    // Otherwise, returns false.
+    bool lookup(uint64_t s_key, uint64_t& out_r_rid) const {
+        if (table_size_ == 0) { // Empty table
+            return false;
+        }
+
+        uint64_t slot_idx = hash_function(s_key);
+        uint64_t initial_slot_idx = slot_idx;
+
+        do {
+            if (!occupied_[slot_idx]) {
+                // Encountered an empty slot, key not found
+                return false;
+            }
+            if (keys_[slot_idx] == s_key) {
+                // Key found
+                out_r_rid = rids_[slot_idx];
+                return true;
+            }
+            slot_idx = (slot_idx + 1) % table_size_;
+        } while (slot_idx != initial_slot_idx); // Stop if we've wrapped around
+
+        // Wrapped around the entire table without finding the key or an empty slot
+        return false;
+    }
+};
+
+} // end anonymous namespace
+
 
 /*
 *RADIX JOIN - Implement Radix join with the following requirements
@@ -42,7 +126,7 @@ result_relation_t &RadixJoin::join() {
         return result;
     }
 
-    double desired_partition_payload_size = static_cast<double>(Config::L3_CACHE_SIZE) / 8.0; // Optimal: L3 Divisor set to 8.0
+    double desired_partition_payload_size = static_cast<double>(Config::L3_CACHE_SIZE) / 8.0;
 
     double num_partitions_for_cache_double = 1.0;
     if (smaller_relation_size_bytes > 0 && desired_partition_payload_size > 0) {
@@ -61,7 +145,7 @@ result_relation_t &RadixJoin::join() {
 
     uint32_t k_radix_bits = std::max({k_for_cache, k_for_cores});
     k_radix_bits = std::max(1u, k_radix_bits);
-    k_radix_bits = std::min(k_radix_bits, 11u); // Tuned: Allow up to 2048 partitions
+    k_radix_bits = std::min(k_radix_bits, 11u);
 
     uint32_t N_partitions = 1 << k_radix_bits;
     uint64_t radix_mask = N_partitions - 1;
@@ -116,7 +200,6 @@ result_relation_t &RadixJoin::join() {
             output.prefix_sum[p] = output.prefix_sum[p - 1] + output.histogram[p - 1];
         }
 
-        // --- Calculate Thread-Specific Write Pointers (Non-Atomic Scatter Setup) ---
         std::vector<std::vector<uint64_t>> thread_starting_write_positions(
             Config::NUM_CORES, std::vector<uint64_t>(current_N_partitions));
 
@@ -128,10 +211,8 @@ result_relation_t &RadixJoin::join() {
             }
         }
 
-        // --- Parallel Scatter Operation (Non-Atomic Per Tuple) ---
         for (uint32_t t_id = 0; t_id < Config::NUM_CORES; ++t_id) {
             threads.emplace_back([&, t_id]() {
-                // Each thread gets its own set of current write pointers, initialized from thread_starting_write_positions
                 std::vector<uint64_t> current_thread_p_counters = thread_starting_write_positions[t_id];
 
                 uint64_t start_idx = t_id * tuples_per_thread;
@@ -141,7 +222,7 @@ result_relation_t &RadixJoin::join() {
                     const auto& tuple = input_relation.data[i];
                     uint64_t p_idx = tuple.key & current_radix_mask;
                     output.partitioned_relation.data[current_thread_p_counters[p_idx]] = tuple;
-                    current_thread_p_counters[p_idx]++; // Non-atomic increment of thread-local counter
+                    current_thread_p_counters[p_idx]++;
                 }
             });
         }
@@ -159,10 +240,17 @@ result_relation_t &RadixJoin::join() {
     std::vector<std::vector<std::pair<uint64_t, uint64_t>>> thread_local_results(Config::NUM_CORES);
 
     std::vector<std::thread> join_threads;
+    std::atomic<uint32_t> next_partition_to_process(0);
 
     for (uint32_t t_id = 0; t_id < Config::NUM_CORES; ++t_id) {
         join_threads.emplace_back([&, t_id]() {
-            for (uint32_t p_idx = t_id; p_idx < N_partitions; p_idx += Config::NUM_CORES) {
+            while(true) {
+                uint32_t p_idx = next_partition_to_process.fetch_add(1, std::memory_order_relaxed);
+
+                if (p_idx >= N_partitions) {
+                    break;
+                }
+
                 uint64_t r_part_start_offset = R_partitioned_output.prefix_sum[p_idx];
                 uint64_t r_part_count = R_partitioned_output.histogram[p_idx];
 
@@ -176,41 +264,22 @@ result_relation_t &RadixJoin::join() {
                 tuple_t* r_part_data = R_partitioned_output.partitioned_relation.data + r_part_start_offset;
                 tuple_t* s_part_data = S_partitioned_output.partitioned_relation.data + s_part_start_offset;
 
-                if (r_part_count <= s_part_count) {
-                    std::unordered_multimap<uint64_t, uint64_t> ht;
-                    ht.reserve(r_part_count);
-                    for (uint64_t i = 0; i < r_part_count; ++i) {
-                        ht.emplace(r_part_data[i].key, r_part_data[i].rid);
-                    }
+                // Always build hash table on R_p (keys in R are unique), probe with S_p.
+                // Use the custom SimpleLinearProbeHashTable
+                SimpleLinearProbeHashTable ht(r_part_data, r_part_count);
 
-                    const int PREFETCH_DISTANCE = 8; // Tuned prefetch distance
-                    for (uint64_t i = 0; i < s_part_count; ++i) {
-                        // Prefetch next element
-                        if (i + PREFETCH_DISTANCE < s_part_count) {
-                            __builtin_prefetch(&s_part_data[i + PREFETCH_DISTANCE], 0, 3); // 0 for read, 3 for high locality
-                        }
-                        auto range = ht.equal_range(s_part_data[i].key);
-                        for (auto it = range.first; it != range.second; ++it) {
-                            thread_local_results[t_id].emplace_back(it->second, s_part_data[i].rid);
-                        }
-                    }
-                } else {
-                    std::unordered_multimap<uint64_t, uint64_t> ht;
-                    ht.reserve(s_part_count);
-                    for (uint64_t i = 0; i < s_part_count; ++i) {
-                        ht.emplace(s_part_data[i].key, s_part_data[i].rid);
-                    }
+                for (uint64_t i = 0; i < s_part_count; ++i) {
+                    // Example of where prefetching was:
+                    // if (i + PREFETCH_DISTANCE < s_part_count) {
+                    //     __builtin_prefetch(&s_part_data[i + PREFETCH_DISTANCE], 0, 3);
+                    // }
 
-                    const int PREFETCH_DISTANCE = 8; // Tuned prefetch distance
-                    for (uint64_t i = 0; i < r_part_count; ++i) {
-                        // Prefetch next element
-                        if (i + PREFETCH_DISTANCE < r_part_count) {
-                            __builtin_prefetch(&r_part_data[i + PREFETCH_DISTANCE], 0, 3); // 0 for read, 3 for high locality
-                        }
-                        auto range = ht.equal_range(r_part_data[i].key);
-                        for (auto it = range.first; it != range.second; ++it) {
-                            thread_local_results[t_id].emplace_back(r_part_data[i].rid, it->second);
-                        }
+                    uint64_t s_key = s_part_data[i].key;
+                    uint64_t s_rid = s_part_data[i].rid;
+                    uint64_t r_rid_found;
+
+                    if (ht.lookup(s_key, r_rid_found)) {
+                        thread_local_results[t_id].emplace_back(r_rid_found, s_rid);
                     }
                 }
             }
@@ -232,6 +301,3 @@ result_relation_t &RadixJoin::join() {
 
     return result;
 }
-
-
-
